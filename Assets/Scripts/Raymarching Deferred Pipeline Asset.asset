@@ -1,0 +1,26 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!114 &11400000
+MonoBehaviour:
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_GameObject: {fileID: 0}
+  m_Enabled: 1
+  m_EditorHideFlags: 0
+  m_Script: {fileID: 11500000, guid: da34c8857c7584cfca43401a0b5857a7, type: 3}
+  m_Name: Raymarching Deferred Pipeline Asset
+  m_EditorClassIdentifier: 
+  copyDepthMaterial: {fileID: 2100000, guid: 2b939d525a46c48c08ec3331d5330ef1, type: 2}
+  copyRayDepthMaterial: {fileID: 2100000, guid: e4b98fa6b36021341b448dd007fdf007, type: 2}
+  deferredMaterial: {fileID: 2100000, guid: 725b762eb33ec4b13a96456b0aefe51e, type: 2}
+  fogMaterial: {fileID: 2100000, guid: 9825e83bbbf204d4f8906121a98ea35a, type: 2}
+  fogDensity: 0
+  fogColor: {r: 0.9433962, g: 0.72175515, b: 0.6185475, a: 1}
+  maxShadowDistance: 80
+  minShadowDistance: 0.05
+  softShadowsFactor: 8
+  shadowIntensity: 0.891
+  epsilon: 0.01
+  compute: {fileID: 7200000, guid: b4925b9ede0c9c543a13481f9f989e45, type: 3}

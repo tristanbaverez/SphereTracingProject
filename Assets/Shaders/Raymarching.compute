@@ -1,0 +1,324 @@
+﻿// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+RWTexture2D<float4> _GBuffer0;
+RWTexture2D<float4> _GBuffer1;
+RWTexture2D<float> _RMShadows;
+RWTexture2D<float> _TempDepthTexture;
+Texture2D<float> _CameraDepthTexture;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+float4x4 _WorldToCamera;
+float4 _ZBufferParams;
+float4 _CameraViewDirection;
+
+float4 _LightDir = float4(0, -1, 0, 0);
+float4 _LightPos = float4(0, 100, 0, 0);
+
+float4 _ShadowParams = float4(0.1,10,16,0.2);
+float _Epsilon = 0.001f;
+
+static const float maxDst = 80;
+static const float shadowBias = _Epsilon * 50;
+
+
+struct Primitive
+{
+    
+    float3 pos;
+    float3 size;
+    float4x4 rot;
+    float3 color;
+    int primitiveType;
+    int operation;
+    float blendStrength;
+    int numChildren;
+};
+
+StructuredBuffer<Primitive> primitives;
+int primitiveNumber;
+
+struct Ray
+{
+    float3 initialOrigin;
+    float3 origin;
+    float3 direction;
+};
+
+Ray CreateRay(float3 origin, float3 direction)
+{
+    Ray ray;
+    ray.initialOrigin = origin;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+float3x3 TruncateMatrix(float4x4 matrix4x4)
+{
+    float3x3 matrix3x3 =
+    {
+        matrix4x4._m00, matrix4x4._m01, matrix4x4._m02,
+        matrix4x4._m10, matrix4x4._m11, matrix4x4._m12,
+        matrix4x4._m20, matrix4x4._m21, matrix4x4._m22
+    };
+    return matrix3x3;
+}
+
+float SphereDistance(float3 eye, float3 centre, float radius)
+{
+    return distance(eye, centre) - radius;
+}
+
+// SDF function for a rotated cube
+float CubeDistance(float3 eye, float3 centre, float3 size, float4x4 rot)
+{
+    // Calculate the vector from the center of the cube to the eye position
+    float3 p = eye - centre;
+
+    // Apply the rotation by multiplying the vector by the 3x3 rotation matrix
+    float3x3 rotationMatrix = TruncateMatrix(rot);
+    float3 localP = mul(p, rotationMatrix);
+
+    // Calculate the distance to the cube's surface
+    float3 o = abs(localP) - size;
+    float ud = length(max(o, 0));
+    float n = max(max(min(o.x, 0), min(o.y, 0)), min(o.z, 0));
+
+    // Return the signed distance
+    return ud + n;
+}
+
+// SDF function for a rotated torus
+float TorusDistance(float3 eye, float3 centre, float r1, float r2, float4x4 rot)
+{
+    // Calculate the vector from the center of the torus to the eye position
+    float3 p = eye - centre;
+
+    // Apply the rotation by multiplying the vector by the 3x3 rotation matrix
+    float3x3 rotationMatrix = TruncateMatrix(rot);
+    float3 localP = mul(p, rotationMatrix);
+
+    // Calculate the distance to the torus's surface
+    float2 q = float2(length(localP.xz) - r1, localP.y);
+    return length(q) - r2;
+}
+
+Ray CreateCameraRay(float2 uv)
+{
+    float3 origin = mul(_CameraToWorld, float4(0, 0, 0, 1)).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    direction = mul(_CameraToWorld, float4(direction, 0)).xyz;
+    direction = normalize(direction);
+    return CreateRay(origin, direction);
+}
+
+// polynomial smooth min (k = 0.1);
+// from https://www.iquilezles.org/www/articles/smin/smin.htm
+float4 Blend(float a, float b, float3 colA, float3 colB, float k)
+{
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0);
+    float blendDst = lerp(b, a, h) - k * h * (1.0 - h);
+    float3 blendCol = lerp(colB, colA, h);
+    return float4(blendCol, blendDst);
+}
+
+float4 Combine(float dstA, float dstB, float3 colourA, float3 colourB, int operation, float blendStrength)
+{
+    float dst = dstA;
+    float3 colour = colourA;
+
+    if (operation == 0)
+    {
+        if (dstB < dstA)
+        {
+            dst = dstB;
+            colour = colourB;
+        }
+    }
+    // Blend
+    else if (operation == 1)
+    {
+        float4 blend = Blend(dstA, dstB, colourA, colourB, blendStrength);
+        dst = blend.w;
+        colour = blend.xyz;
+    }
+    // Cut
+    else if (operation == 2)
+    {
+        // max(a,-b)
+        if (-dstB > dst)
+        {
+            dst = -dstB;
+            colour = colourB;
+        }
+    }
+    // Mask
+    else if (operation == 3)
+    {
+        // max(a,b)
+        if (dstB > dst)
+        {
+            dst = dstB;
+            colour = colourB;
+        }
+    }
+
+    return float4(colour, dst);
+}
+
+float GetPrimitiveDistance(Primitive primitive, float3 eye)
+{
+    if (primitive.primitiveType == 0)
+    {
+        return SphereDistance(eye, primitive.pos, primitive.size.x);
+    }
+    else if (primitive.primitiveType == 1)
+    {
+        return CubeDistance(eye, primitive.pos, primitive.size, primitive.rot);
+    }
+    else if (primitive.primitiveType == 2)
+    {
+        return TorusDistance(eye, primitive.pos, primitive.size.x, primitive.size.y, primitive.rot);
+    }
+    return maxDst;
+}
+
+float4 SceneInfo(float3 eye)
+{
+    float globalDst = maxDst;
+    float3 globalColour = 1;
+    
+    for (int i = 0; i < primitiveNumber; i++)
+    {
+        Primitive primitive = primitives[i];
+        int numChildren = primitive.numChildren;
+
+        float localDst = GetPrimitiveDistance(primitive, eye);
+        float3 localColour = primitive.color;
+
+
+        for (int j = 0; j < numChildren; j++)
+        {
+            Primitive childPrim = primitives[i + j + 1];
+            float childDst = GetPrimitiveDistance(childPrim, eye);
+
+            float4 combined = Combine(localDst, childDst, localColour, childPrim.color, childPrim.operation, childPrim.blendStrength);
+            localColour = combined.xyz;
+            localDst = combined.w;
+        }
+        i += numChildren; 
+        
+        float4 globalCombined = Combine(globalDst, localDst, globalColour, localColour, primitive.operation, primitive.blendStrength);
+        globalColour = globalCombined.xyz;
+        globalDst = globalCombined.w;
+    }
+
+    return float4(globalColour, globalDst);
+}
+
+float3 EstimateNormal(float3 p)
+{
+    float x = SceneInfo(float3(p.x + _Epsilon, p.y, p.z)).w - SceneInfo(float3(p.x - _Epsilon, p.y, p.z)).w;
+    float y = SceneInfo(float3(p.x, p.y + _Epsilon, p.z)).w - SceneInfo(float3(p.x, p.y - _Epsilon, p.z)).w;
+    float z = SceneInfo(float3(p.x, p.y, p.z + _Epsilon)).w - SceneInfo(float3(p.x, p.y, p.z - _Epsilon)).w;
+    return normalize(float3(x, y, z));
+}
+
+// Shadows
+// adapted from from https://iquilezles.org/articles/rmshadows/
+float CalculateShadow(Ray ray)
+{
+    float3 ro = ray.origin;
+    float3 rd = -normalize(_LightDir).xyz;
+    float mint = _ShadowParams.x;
+    float maxt = _ShadowParams.y;
+    float k = _ShadowParams.z;
+    float res = 1.0;
+    float t = mint;
+    for (int i = 0; i < 256 && t < maxt; i++)
+    {
+        float h = SceneInfo(ro + rd * t).w;
+        if (h < 0.001)
+            return lerp(1, 0, _ShadowParams.w);
+        res = min(res, k * h / t);
+        t += h;
+    }
+    return lerp(1, res, _ShadowParams.w);
+}
+
+float LinearEyeDepth(float rawdepth)
+{
+    return 1.0 / (_ZBufferParams.z * rawdepth + _ZBufferParams.w);
+}
+
+float RawDepth(float linearDepth)
+{
+    return(1.0 / _ZBufferParams.z) * (1.0 / linearDepth - _ZBufferParams.w);
+}
+
+[numthreads(8, 8, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID)
+{
+    // Init clip space camera UV
+    uint width, height;
+    _GBuffer0.GetDimensions(width, height);
+    float2 clipSpaceUV = id.xy / float2(width, height) * 2 - 1;
+    
+    // Init ray
+    float rayDst = 0;
+    int marchSteps = 0;
+    Ray ray = CreateCameraRay(clipSpaceUV);
+    
+    // Init depth and shadows
+    float depth = _CameraDepthTexture[id.xy].x;
+    _TempDepthTexture[id.xy] = depth;
+    _RMShadows[id.xy] = 1.0;
+    
+    
+    while (rayDst < maxDst)
+    {
+        marchSteps++;
+        float4 sceneInfo = SceneInfo(ray.origin);
+        float dst = sceneInfo.w;
+        
+        float3 pointOnSurface = ray.origin + ray.direction * dst;
+        // Transform the intersection point to camera space
+        float4 pointInCameraSpace = mul(_WorldToCamera, float4(pointOnSurface, 1.0));
+        // The z-component in camera space gives the linear depth
+        float linearRMDepth = -pointInCameraSpace.z;
+        // Convert the linear depth back to raw depth format
+        float rawDepth = RawDepth(linearRMDepth);
+        
+        // Z test
+        if (rawDepth < depth){
+            
+            
+            float factor = dot(_CameraViewDirection.xyz, ray.direction);
+            float realDepth = LinearEyeDepth(depth) / factor;
+            ray.origin = ray.initialOrigin + ray.direction * realDepth;
+            float shadow = CalculateShadow(ray);
+            
+            _RMShadows[id.xy] = shadow;
+            break;
+        }
+        
+        if (dst <= _Epsilon)
+        {
+            float3 normal = EstimateNormal(pointOnSurface - ray.direction * _Epsilon);
+            float3 col = sceneInfo.xyz;
+            float shadow = CalculateShadow(ray) ;
+            
+            _GBuffer0[id.xy] = float4(col, 0.0);
+            _GBuffer1[id.xy] = float4((normal + 1) * 0.5, 0.5);
+            _RMShadows[id.xy] = shadow;
+            
+            _TempDepthTexture[id.xy] = rawDepth;
+            break;
+        }
+        
+        ray.origin += ray.direction * dst;
+        rayDst += dst;  
+    }
+}
